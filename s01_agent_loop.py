@@ -2,7 +2,6 @@
 import os
 import subprocess
 
-from typing import Any
 from anthropic import Anthropic
 from anthropic.types import Message, MessageParam, ToolParam, ContentBlock
 from typing import List
@@ -23,7 +22,7 @@ if not MODEL:
 
 SYSTEM: str = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-TOOLS : list[ToolParam] = [
+TOOLS: list[ToolParam] = [
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -66,7 +65,7 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
             system=SYSTEM,
             messages=messages,
             max_tokens=8192,
-            tools = TOOLS
+            tools=TOOLS
         )
 
         messages.append({ "role": "assistant", "content": response.content })
@@ -113,6 +112,4 @@ if __name__ == "__main__":
                     print(f"\033[35m{block}\033[0m")
 
         print()
-
-
 
