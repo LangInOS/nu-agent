@@ -86,7 +86,7 @@ TOOL_HANDLERS = {
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
-    if not path.is_relative_to((WORKDIR)):
+    if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
@@ -103,30 +103,19 @@ def run_bash(command: str):
                                 timeout=120,
                                 capture_output=True)
 
-        out = result.stdout + result.stderr
+        out = (result.stdout + result.stderr).strip()
 
         return out if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-def run_read(path: str, limit: int) -> str:
+def run_read(path: str, limit: int | None = None) -> str:
     try:
         text = safe_path(path).read_text()
         lines = text.splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"...({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)[:50000]
-    except Exception as e:
-        return f"Error: {e}"
-
-def run_edit(path: str, old_text: str, new_text: str) -> str:
-    try:
-        fp = safe_path(path)
-        content = fp.read_text()
-        if old_text not in content:
-            return f"Error: Text not found in {path}"
-        fp.write_text(content.replace(old_text, new_text,1))
-        return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -139,12 +128,23 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    try:
+        fp = safe_path(path)
+        content = fp.read_text()
+        if old_text not in content:
+            return f"Error: Text not found in {path}"
+        fp.write_text(content.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
 
 
 # -- agent loop: calls tools until the llm stops --
 def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
     while(True):
-        print(f"\033[36m thinking...\n\033[0m")
+        print(f"\033[36mthinking...\n\033[0m")
         response: Message = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     history: list[MessageParam] = []
     while(True):
         try:
-            query: str = input("\033[36mYou >> \033[0m ")
+            query: str = input("\033[36mYou >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
 
