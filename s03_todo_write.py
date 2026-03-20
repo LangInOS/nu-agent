@@ -16,10 +16,7 @@ WORKDIR = Path.cwd()
 
 client: Anthropic = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 
-MODEL: str | None = os.getenv("MODEL_ID")
-
-if not MODEL:
-    raise ValueError("MODEL_ID environment variable not set")
+MODEL: str = os.getenv("MODEL_ID", "glm-5")
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
@@ -201,7 +198,8 @@ TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"],
+                                       kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
@@ -220,9 +218,12 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
         if response.stop_reason != "tool_use":
             return response.content
 
-        results: list[MessageParam] = []
+        results: list = []
         used_todo = False
         for block in response.content:
+            if block.type == "text":
+                print(f"\033[90m[Model Thought]: {block.text}\033[0m")
+
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 print("\033[32m--------------------\033[0m")
@@ -235,6 +236,9 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
                 if block.name == "todo":
                     used_todo = True
+                    print("\n\033[33m=== 📋 INITIAL PLAN (Todo List) ===\033[0m")
+                    print(output)
+                    print("\033[33m=================================\033[0m\n")
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
@@ -259,7 +263,7 @@ if __name__ == "__main__":
 
         print("\n")
 
-        if isinstance(response_content, List):
+        if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
                     print(f"\033[35m{block.text}\033[0m")
