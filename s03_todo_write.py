@@ -206,7 +206,7 @@ TOOL_HANDLERS = {
 }
 
 
-# -- agent loop: calls tools until the llm stops --
+# Agent Loop
 def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
     rounds_since_todo = 0
     while True:
