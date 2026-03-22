@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import List
@@ -15,6 +16,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client: Anthropic = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL: str = os.getenv("MODEL_ID", "glm-5")
+
+SKILLS_DIR = WORKDIR / "skills"
 
 
 # === SECTION: basic tools ===
@@ -116,16 +119,46 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+# === SECTION: skills loader ===
+class SkillLoader:
+    def __init__(self, skills_path: Path) -> None:
+        self.skills = {}
+        if skills_path.exists():
+            for f in sorted(skills_path.rglob("SKILL.md")):
+                text = f.read_text()
+                match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+                meta, body = {}, text
+                if match:
+                    for line in match.group(1).strip().splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            meta[k.strip()] = v.strip()
+                    body = match.group(2).strip()
+                name = meta.get("name", f.parent.name)
+                self.skills[name] = {"meta": meta, "body": body}
+
+    def descriptions(self) -> str:
+        if not self.skills: return "(no skills)"
+        return "\n".join(f" - {n}: {s['meta'].get('description', '-')}" for n, s in self.skills.items())
+
+    def load(self, name: str) -> str:
+        s = self.skills.get(name)
+        if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
 
 # === SECTION: global instances ===
 TODO = TodoManager()
+SKILLS = SkillLoader(SKILLS_DIR)
 
 
 # === SECTION: system prompt ===
-SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+SYSTEM = f"""
+You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Use the task tool to delegate exploration or subtasks.
-Prefer tools over prose."""
+Use load_skill for specialized knowledge before tacking unfamiliar topics.
+Skills available: {SKILLS.descriptions()}
+"""
 
 # === SECTION: tool dispatch===
 TOOLS: list[ToolParam] = [
@@ -210,6 +243,17 @@ TOOLS: list[ToolParam] = [
             },
             "required": ["prompt"]
         }
+    },
+    {
+        "name": "load_skill",
+        "description": "Load specialized knowledge by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "skill name to load"}
+            },
+            "required": ["name"]
+        }
     }
 ]
 
@@ -218,9 +262,11 @@ TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"],
+                                       kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
     "task": lambda **kw: run_subagent(kw["prompt"]),
+    "load_skill": lambda **kw: SKILLS.load(kw["name"])
 }
 
 # Subagent
@@ -233,7 +279,8 @@ def run_subagent(prompt: str) -> str:
     sub_msgs: list[MessageParam] = [{"role": "user", "content": prompt}]
     sub_resp = None
     for _ in range(30):
-        sub_resp = client.messages.create(model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_msgs,tools=sub_tools, max_tokens=8192)
+        sub_resp = client.messages.create(
+            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_msgs,tools=sub_tools, max_tokens=8192)
         sub_msgs.append({"role": "assistant", "content": sub_resp.content})
         if sub_resp.stop_reason != "tool_use":
             break
@@ -242,12 +289,15 @@ def run_subagent(prompt: str) -> str:
             if block.type == "tool_use":
                 handler = sub_handlers.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+                results.append({
+                    "type": "tool_result", 
+                    "tool_use_id": block.id, 
+                    "content": str(output)[:50000]})
         sub_msgs.append({"role": "user", "content": results})
 
     if sub_resp:
         return "".join(b.text for b in sub_resp.content if hasattr(b, "text")) or "(no summary)"
-    
+
     return "(subagent failed)"
 
 
@@ -261,7 +311,6 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
         )
 
         messages.append({"role": "assistant", "content": response.content})
-
         if response.stop_reason != "tool_use":
             return response.content
 
