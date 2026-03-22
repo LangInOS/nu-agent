@@ -13,17 +13,11 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-
 client: Anthropic = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-
 MODEL: str = os.getenv("MODEL_ID", "glm-5")
 
 
-SYSTEM = f"""You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."""
-SUBAGENT_SYSTEM = f"You are a coding subagent at{WORKDIR}. Complete the given task, then summarize your findings."
-
-
-# Basic Tools
+# === SECTION: basic tools ===
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -81,7 +75,60 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-BAISC_TOOLS: list[ToolParam] = [
+# === SECTION: todos manager ===
+class TodoManager:
+    def __init__(self) -> None:
+        self.items: list[dict] = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+
+            if status not in ["pending", "in_progress", "completed"]:
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[  ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+# === SECTION: global instances ===
+TODO = TodoManager()
+
+
+# === SECTION: system prompt ===
+SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Use the task tool to delegate exploration or subtasks.
+Prefer tools over prose."""
+
+# === SECTION: tool dispatch===
+TOOLS: list[ToolParam] = [
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -122,9 +169,31 @@ BAISC_TOOLS: list[ToolParam] = [
             "required": ["path", "old_text", "new_text"],
         },
     },
-]
-
-TOOLS = BAISC_TOOLS + [
+    {
+        "name": "todo",
+        "description": "Update task list. Track progress on multi-step tasks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["id", "text", "status"],
+                    },
+                }
+            },
+            "required": ["items"],
+        },
+    },
     {
         "name": "task",
         "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
@@ -144,43 +213,47 @@ TOOLS = BAISC_TOOLS + [
     }
 ]
 
+
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"],
-                                       kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
+    "task": lambda **kw: run_subagent(kw["prompt"]),
 }
 
 # Subagent
 def run_subagent(prompt: str) -> str:
-    sub_messages: list[MessageParam] = [{"role": "user", "content": prompt}]
-    response = None
+    sub_tool_names = {"bash", "read_file", "write_file", "edit_file"}
+    sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
+    sub_handlers = {k: v for k, v in TOOL_HANDLERS.items() if k in sub_tool_names}
+
+    SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+    sub_msgs: list[MessageParam] = [{"role": "user", "content": prompt}]
+    sub_resp = None
     for _ in range(30):
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=BAISC_TOOLS, max_tokens=8192
-        )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        sub_resp = client.messages.create(model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_msgs,tools=sub_tools, max_tokens=8192)
+        sub_msgs.append({"role": "assistant", "content": sub_resp.content})
+        if sub_resp.stop_reason != "tool_use":
             break
         results = []
-        for block in response.content:
+        for block in sub_resp.content:
             if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
+                handler = sub_handlers.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+        sub_msgs.append({"role": "user", "content": results})
 
-    if not response:
-        return "(no summary)"
-    else:
-        return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
-
+    if sub_resp:
+        return "".join(b.text for b in sub_resp.content if hasattr(b, "text")) or "(no summary)"
+    
+    return "(subagent failed)"
 
 
 # Agent Loop
 def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
+    rounds_since_todo = 0
     while True:
         print(f"\033[36mthinking...\n\033[0m")
         response: Message = client.messages.create(
@@ -193,26 +266,29 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
             return response.content
 
         results: list = []
+        used_todo = False
         for block in response.content:
             if block.type == "text":
                 print(f"\033[90m[Model Thought]: {block.text}\033[0m")
 
             if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subagent")
-                    prompt = str(block.input["prompt"])
-                    print(f"> task({desc}): {prompt}")
-                    output = run_subagent(prompt=prompt)
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
+                handler = TOOL_HANDLERS.get(block.name)
                 print("\033[32m--------------------\033[0m")
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
                 print(f"\033[32m> {block.name}: {output}\033[0m")
                 print("\033[32m--------------------\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+                if block.name == "todo":
+                    used_todo = True
+                    print("\n\033[33m=== 📋 INITIAL PLAN (Todo List) ===\033[0m")
+                    print(output)
+                    print("\033[33m=================================\033[0m\n")
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
 
         messages.append({"role": "user", "content": results})
 
@@ -232,13 +308,12 @@ if __name__ == "__main__":
 
         response_content: List[ContentBlock] = agent_loop(history)
 
-        print("\n")
+        print("\n final reponse: \n")
 
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
-                    text = block.text
-                    print(f"\033[35m{text}\033[0m")
+                    print(f"\033[35m{block.text}\033[0m")
                 else:
                     print(f"\033[35m{block}\033[0m")
 
