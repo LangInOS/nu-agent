@@ -51,7 +51,7 @@ def run_bash(command: str) -> str:
     if any(d in command for d in forbidden):
         return "Error: Dangerous command blocked"
     try:
-        result = subprocess.run(command, shell=True, cwd=WORKDIR, text=True, 
+        result = subprocess.run(command, shell=True, cwd=WORKDIR, text=True,
                                 timeout=120, capture_output=True)
         out = (result.stdout + result.stderr).strip()
         return out[:50000] if out else "(no output)"
@@ -112,7 +112,7 @@ class TodoManager:
                 raise ValueError(f"Item {item_id}: activeForm required")
             if status == "in_progress":
                 in_progress_count += 1
-            validated.append({"id": item_id, "content": content, "status": status, 
+            validated.append({"id": item_id, "content": content, "status": status,
                               "activeForm": activeForm})
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress at a time")
@@ -140,20 +140,20 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     sub_tool_names = {"bash", "read_file"}
     if agent_type != "Explore":
         sub_tool_names.update({"write_file", "edit_file"})
-    
+
     sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
     sub_handlers = {k: v for k, v in TOOL_HANDLERS.items() if k in sub_tool_names}
 
-    SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. 
+    SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}.
                         Complete the given task, then summarize your findings."""
     sub_msgs: list[MessageParam] = [{"role": "user", "content": prompt}]
     sub_resp = None
     for _ in range(30):
         sub_resp = client.messages.create(
-            model=MODEL, 
-            system=SUBAGENT_SYSTEM, 
-            messages=sub_msgs, 
-            tools=sub_tools, 
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,
+            messages=sub_msgs,
+            tools=sub_tools,
             max_tokens=8192
         )
         sub_msgs.append({"role": "assistant", "content": sub_resp.content})
@@ -198,7 +198,7 @@ class SkillLoader:
     def descriptions(self) -> str:
         if not self.skills:
             return "(no skills)"
-        return "\n".join(f"  - {n}: {s['meta'].get('description', '-')}" 
+        return "\n".join(f"  - {n}: {s['meta'].get('description', '-')}"
                     for n, s in self.skills.items())
 
     def load(self, name: str) -> str:
@@ -227,7 +227,7 @@ class TaskManager:
         (TASKS_DIR / f"task_{task['id']}.json").write_text(json.dumps(task, indent=2))
 
     def create(self, subject: str, description: str = "") -> str:
-        task = {"id": self._next_id(), "subject": subject, "description": description, 
+        task = {"id": self._next_id(), "subject": subject, "description": description,
                 "status": "pending", "owner": None, "blockedBy": [], "blocks": []}
         self._save(task)
         return json.dumps(task, indent=2)
@@ -321,8 +321,8 @@ def auto_compact(messages: list[MessageParam]) -> list[MessageParam]:
     conversation_text = json.dumps(messages, default=str)[:80000]
     response = client.messages.create(
         model=MODEL,
-        messages=[{"role": "user", "content": """Summarize this conversation for continuity. Include: 
-                    1) What was accomplished, 2) Current state, 3) Key decisions made. 
+        messages=[{"role": "user", "content": """Summarize this conversation for continuity. Include:
+                    1) What was accomplished, 2) Current state, 3) Key decisions made.
                     Be concise but preserve critical details.\n\n""" + conversation_text}],
         max_tokens=2000,
     )
@@ -359,7 +359,7 @@ class BackgroundManager:
         if task_id:
             task = self.tasks.get(task_id)
             return f"[{task['status']}] {task.get('result', '(running)')}" if task else f"Unknown: {task_id}"
-        return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" 
+        return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}"
                          for k, v in self.tasks.items()) or "No background tasks."
 
     def drain(self) -> list:
@@ -445,7 +445,7 @@ class TeammateManager:
 
     def _loop(self, name: str, role: str, prompt: str) -> None:
         team_name = self.config["team_name"]
-        sys_prompt = f"""You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. 
+        sys_prompt = f"""You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}.
                          Use idle when done with current work. You may auto-claim tasks."""
         messages = [{"role": "user", "content": prompt}]
         tool_names = {"bash", "read_file", "write_file", "edit_file", "send_message", "idle", "claim_task"}
@@ -460,7 +460,7 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = client.messages.create(model=MODEL, system=sys_prompt, messages=messages, 
+                    response = client.messages.create(model=MODEL, system=sys_prompt, messages=messages,
                                                       tools=tools, max_tokens=8192)
                 except Exception:
                     self._set_status(name, "shutdown")
@@ -480,7 +480,7 @@ class TeammateManager:
                         elif block.name == "send_message":
                             output = self.bus.send(name, block.input["to"], block.input["content"])
                         else:
-                            dispatch = {k: v for k, v in TOOL_HANDLERS.items() 
+                            dispatch = {k: v for k, v in TOOL_HANDLERS.items()
                                         if k in {"bash", "read_file", "write_file", "edit_file"}}
                             output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
                         print(f"  [{name}] {block.name}: {str(output)[:120]}")
@@ -525,9 +525,9 @@ class TeammateManager:
                 self._set_status(name, "shutdown")
                 return
             self._set_status(name, "working")
-    
+
     def list_all(self) -> str:
-        if not self.config["members"]: 
+        if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
         for member in self.config["members"]:
@@ -568,11 +568,11 @@ TEAM = TeammateManager(BUS, TASKS)
 
 # === SECTION: system prompt ===
 SYSTEM = f"""
-You are a coding agent at {WORKDIR}. Use tools to solve tasks. 
-Prefer task_create/task_update/task_list for multi-step work. 
-Use todo for short checklists. Mark in_progress before starting, completed when done. 
-Use task for subagent delegation to explore unknown topics or subtasks. 
-Use load_skill for specialized knowledge before tacking unfamiliar topics. 
+You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+Prefer task_create/task_update/task_list for multi-step work.
+Use todo for short checklists. Mark in_progress before starting, completed when done.
+Use task for subagent delegation to explore unknown topics or subtasks.
+Use load_skill for specialized knowledge before tacking unfamiliar topics.
 Use background_run for long-running commands.
 Spawn teammates and communicate via inboxes.
 Skills available: {SKILLS.descriptions()}
@@ -683,10 +683,10 @@ def agent_loop(messages: list[MessageParam]) -> list[ContentBlock]:
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
         # llm call
         response: Message = client.messages.create(
-            model=MODEL, 
-            system=SYSTEM, 
-            messages=messages, 
-            max_tokens=8192, 
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            max_tokens=8192,
             tools=TOOLS
         )
 
