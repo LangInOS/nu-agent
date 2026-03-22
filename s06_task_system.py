@@ -1,7 +1,12 @@
 import os
 import re
+import json
 import subprocess
+import threading
+import time
+import uuid
 from pathlib import Path
+from queue import Queue
 from typing import List
 
 from anthropic import Anthropic
@@ -18,6 +23,7 @@ client: Anthropic = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL: str = os.getenv("MODEL_ID", "glm-5")
 
 SKILLS_DIR = WORKDIR / "skills"
+TASK_DIR = WORKDIR / ".tasks"
 
 
 # === SECTION: basic tools ===
@@ -146,16 +152,84 @@ class SkillLoader:
         if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
 
+# === SECTION: task manager ===
+class TaskManager:
+    def __init__(self) -> None:
+        TASK_DIR.mkdir(exist_ok=True)
+    
+    def _next_id(self) -> int:
+        ids = [int(f.stem.split("_")[1]) for f in TASK_DIR.glob("task_*.json")]
+        return max(ids, default=0) + 1
+    
+    def _load(self, task_id: int) -> dict:
+        p = TASK_DIR / f"task_{task_id}.json"
+        if not p.exists(): raise ValueError(f"Task {task_id} not found")
+        return json.loads(p.read_text())
+    
+    def _save(self, task: dict) -> None:
+        (TASK_DIR / f"task_{task['id']}.json").write_text(json.dumps(task, indent=2))
+    
+    def create(self, subject: str, description: str = "") -> str:
+        task = {"id": self._next_id(), "subject": subject, "description": description,
+                "status": "pending", "owner": None, "blockedBy": [], "blocks": []}
+        self._save(task)
+        return json.dumps(task, indent=2)
+    
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2)
+
+    def update(self, task_id: int, status: str = None, add_blocked_by: list = None, add_blocks: list = None) -> str:
+        task = self._load(task_id)
+        if status:
+            task["status"] = status
+            if status == "completed":
+                for f in TASK_DIR.glob(f"task_*.json"):
+                    t = json.loads(f.read_text())
+                    if task_id in t.get("blockedBy", []):
+                        t["blockedBy"].remove(task_id)
+                        self._save(t)
+            if status == "deleted":
+                (TASK_DIR / f"task_{task_id}.json").unlink(missing_ok=True)
+                return f"Task {task_id} deleted."
+        if add_blocked_by:
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if add_blocks:
+            task["blocks"] = list(set(task["blocks"] + add_blocks))
+        self._save(task)
+        return json.dumps(task, indent=2)
+
+    def list_all(self) -> str:
+        tasks = [json.loads(f.read_text()) for f in sorted(TASK_DIR.glob("task_*.json"))]
+        if not tasks: return "No tasks."
+        lines = []
+        for task in tasks:
+            m = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(task["status"], "[?]")
+            owner = f" @{task['owner']}" if task.get("owner") else ""
+            blocked = f" (blocked by: {task['blockedBy']})" if task.get("blockedBy") else ""
+            lines.append(f"{m} #{task['id']}: {task['subject']}{owner}{blocked}")
+
+        return "\n".join(lines)
+    
+    def claim(self, task_id: int ,owner: str) -> str:
+        task = self._load(task_id)
+        task["owner"] = owner
+        task["status"] = "in_progress"
+        self._save(task)
+        return f"Claimed task {task_id} for {owner}."
+        
+
 # === SECTION: global instances ===
 TODO = TodoManager()
 SKILLS = SkillLoader(SKILLS_DIR)
+TASKS = TaskManager()
 
 
 # === SECTION: system prompt ===
 SYSTEM = f"""
 You are a coding agent at {WORKDIR}. Use tools to solve tasks.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Use the task tool to delegate exploration or subtasks.
+Prefer task_create/task_update/task_list for multi-step work.
+Use todo for short checklists. Mark in_progress before starting, completed when done.
+Use task for subagent delegation to explore unknown topics or subtasks.
 Use load_skill for specialized knowledge before tacking unfamiliar topics.
 Skills available: {SKILLS.descriptions()}
 """
@@ -254,7 +328,44 @@ TOOLS: list[ToolParam] = [
             },
             "required": ["name"]
         }
-    }
+    },
+    {
+        "name": "task_create", 
+        "description": "Create a new task.",
+        "input_schema": {
+            "type": "object", 
+            "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, 
+            "required": ["subject"]
+        }
+    },
+    {
+        "name": "task_update", 
+        "description": "Update a task's status or dependencies.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"}, 
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, 
+                "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, 
+                "add_blocks": {"type": "array", "items": {"type": "integer"}}
+            }, 
+            "required": ["task_id"]
+        }
+     },
+    {
+        "name": "task_list", 
+        "description": "List all tasks with status summary.",
+        "input_schema": {"type": "object", "properties": {}}
+     },
+    {
+        "name": "task_get", 
+        "description": "Get full details of a task by ID.",
+        "input_schema": {
+            "type": "object", 
+            "properties": {"task_id": {"type": "integer"}}, 
+            "required": ["task_id"]
+        }
+    },
 ]
 
 
@@ -266,7 +377,11 @@ TOOL_HANDLERS = {
                                        kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
     "task": lambda **kw: run_subagent(kw["prompt"]),
-    "load_skill": lambda **kw: SKILLS.load(kw["name"])
+    "load_skill": lambda **kw: SKILLS.load(kw["name"]),
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw["description"]),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("add_blocks")),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 # Subagent
@@ -322,11 +437,11 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
 
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                print("\033[32m--------------------\033[0m")
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
+                print("\033[32m--------------------\033[0m")
                 print(f"\033[32m> {block.name}: {output}\033[0m")
                 print("\033[32m--------------------\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
