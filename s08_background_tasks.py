@@ -147,12 +147,14 @@ class SkillLoader:
                 self.skills[name] = {"meta": meta, "body": body}
 
     def descriptions(self) -> str:
-        if not self.skills: return "(no skills)"
+        if not self.skills:
+            return "(no skills)"
         return "\n".join(f" - {n}: {s['meta'].get('description', '-')}" for n, s in self.skills.items())
 
     def load(self, name: str) -> str:
         s = self.skills.get(name)
-        if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        if not s:
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
 
 
@@ -160,25 +162,33 @@ class SkillLoader:
 class TaskManager:
     def __init__(self) -> None:
         TASK_DIR.mkdir(exist_ok=True)
-    
+
     def _next_id(self) -> int:
         ids = [int(f.stem.split("_")[1]) for f in TASK_DIR.glob("task_*.json")]
         return max(ids, default=0) + 1
-    
+
     def _load(self, task_id: int) -> dict:
         p = TASK_DIR / f"task_{task_id}.json"
-        if not p.exists(): raise ValueError(f"Task {task_id} not found")
+        if not p.exists():
+            raise ValueError(f"Task {task_id} not found")
         return json.loads(p.read_text())
-    
+
     def _save(self, task: dict) -> None:
         (TASK_DIR / f"task_{task['id']}.json").write_text(json.dumps(task, indent=2))
-    
+
     def create(self, subject: str, description: str = "") -> str:
-        task = {"id": self._next_id(), "subject": subject, "description": description,
-                "status": "pending", "owner": None, "blockedBy": [], "blocks": []}
+        task = {
+            "id": self._next_id(),
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "owner": None,
+            "blockedBy": [],
+            "blocks": []
+        }
         self._save(task)
         return json.dumps(task, indent=2)
-    
+
     def get(self, task_id: int) -> str:
         return json.dumps(self._load(task_id), indent=2)
 
@@ -204,7 +214,8 @@ class TaskManager:
 
     def list_all(self) -> str:
         tasks = [json.loads(f.read_text()) for f in sorted(TASK_DIR.glob("task_*.json"))]
-        if not tasks: return "No tasks."
+        if not tasks:
+            return "No tasks."
         lines = []
         for task in tasks:
             m = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(task["status"], "[?]")
@@ -213,8 +224,8 @@ class TaskManager:
             lines.append(f"{m} #{task['id']}: {task['subject']}{owner}{blocked}")
 
         return "\n".join(lines)
-    
-    def claim(self, task_id: int ,owner: str) -> str:
+
+    def claim(self, task_id: int, owner: str) -> str:
         task = self._load(task_id)
         task["owner"] = owner
         task["status"] = "in_progress"
@@ -268,33 +279,84 @@ def auto_compact(messages: list[MessageParam]) -> list[MessageParam]:
     conversation_text = json.dumps(messages, default=str)[:80000]
     response = client.messages.create(
         model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity. Include: "
-            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        messages=[{
+            "role": "user",
+            "content": (
+                "Summarize this conversation for continuity. Include: "
+                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+                "Be concise but preserve critical details.\n\n" + conversation_text
+            )
+        }],
         max_tokens=2000,
     )
     summary = response.content[0].text
     # Replace all messages with compressed summary
     return [
-        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the context from the summary. Continuing."
+        },
     ]
+
+# === SECTION: background ===
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}
+        self.notifications = Queue()
+
+    def run(self, command: str, timeout: int = 120) -> str:
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "command": command, "result": None}
+        threading.Thread(target=self._exec, args=(task_id, command, timeout), daemon=True).start()
+        return task_id
+
+    def _exec(self, task_id: str, command: str, timeout: int):
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=WORKDIR, timeout=timeout, capture_output=True, text=True
+            )
+            output = (r.stdout + r.stderr).strip()
+            self.tasks[task_id].update({"status": "completed", "result": output or "(No output)"})
+        except Exception as e:
+            self.tasks[task_id].update({"status": "error", "result": f"Error: {str(e)}"})
+        self.notifications.put({
+            "task_id": task_id,
+            "status": self.tasks[task_id]["status"],
+            "result": self.tasks[task_id]["result"]
+        })
+
+    def check(self, task_id: str = None) -> str:
+        if task_id:
+            task = self.tasks.get(task_id)
+            return f"[{task['status']}] {task.get('result', '(running)')}" if task else f"Unknown: {task_id}"
+        return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" for k, v in self.tasks.items()) or "No background tasks."
+
+    def drain(self) -> list:
+        notifs = []
+        while not self.notifications.empty():
+            notifs.append(self.notifications.get_nowait())
+        return notifs
 
 
 # === SECTION: global instances ===
 TODO = TodoManager()
 SKILLS = SkillLoader(SKILLS_DIR)
 TASKS = TaskManager()
+BG = BackgroundManager()
 
 
 # === SECTION: system prompt ===
 SYSTEM = f"""
-You are a coding agent at {WORKDIR}. Use tools to solve tasks.
-Prefer task_create/task_update/task_list for multi-step work.
-Use todo for short checklists. Mark in_progress before starting, completed when done.
-Use task for subagent delegation to explore unknown topics or subtasks.
-Use load_skill for specialized knowledge before tacking unfamiliar topics.
+You are a coding agent at {WORKDIR}. Use tools to solve tasks. 
+Prefer task_create/task_update/task_list for multi-step work. 
+Use todo for short checklists. Mark in_progress before starting, completed when done. 
+Use task for subagent delegation to explore unknown topics or subtasks. 
+Use load_skill for specialized knowledge before tacking unfamiliar topics. 
+Use background_run for long-running commands.
 Skills available: {SKILLS.descriptions()}
 """
 
@@ -387,53 +449,71 @@ TOOLS: list[ToolParam] = [
         "description": "Load specialized knowledge by name.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "skill name to load"}
-            },
+            "properties": {"name": {"type": "string", "description": "skill name to load"}},
             "required": ["name"]
         }
     },
     {
-        "name": "task_create", 
+        "name": "task_create",
         "description": "Create a new task.",
         "input_schema": {
-            "type": "object", 
-            "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, 
+            "type": "object",
+            "properties": {"subject": {"type": "string"}, "description": {"type": "string"}},
             "required": ["subject"]
         }
     },
     {
-        "name": "task_update", 
+        "name": "task_update",
         "description": "Update a task's status or dependencies.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "task_id": {"type": "integer"}, 
-                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, 
-                "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, 
+                "task_id": {"type": "integer"},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                "add_blocked_by": {"type": "array", "items": {"type": "integer"}},
                 "add_blocks": {"type": "array", "items": {"type": "integer"}}
-            }, 
-            "required": ["task_id"]
-        }
-     },
-    {
-        "name": "task_list", 
-        "description": "List all tasks with status summary.",
-        "input_schema": {"type": "object", "properties": {}}
-     },
-    {
-        "name": "task_get", 
-        "description": "Get full details of a task by ID.",
-        "input_schema": {
-            "type": "object", 
-            "properties": {"task_id": {"type": "integer"}}, 
+            },
             "required": ["task_id"]
         }
     },
     {
-        "name": "compress", 
+        "name": "task_list",
+        "description": "List all tasks with status summary.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "task_get",
+        "description": "Get full details of a task by ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"}},
+            "required": ["task_id"]
+        }
+    },
+    {
+        "name": "compress",
         "description": "Manually compress conversation context.",
         "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "background_run",
+        "description": "Run command in background thread.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"}
+            },
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "check_background",
+        "description": "Check background task status.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}}
+        }
     },
 ]
 
@@ -442,16 +522,19 @@ TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"],
-                                       kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
     "task": lambda **kw: run_subagent(kw["prompt"]),
     "load_skill": lambda **kw: SKILLS.load(kw["name"]),
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw["description"]),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("add_blocks")),
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("add_blocks")
+    ),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
     "compress": lambda **kw: "Compressing...",
+    "background_run": lambda **kw: BG.run(kw["command"], kw.get("timeout", 120)),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
 
@@ -470,7 +553,7 @@ def print_thought(block: ContentBlock):
     print(f"\033[90m[Model Thought]: {block.text}\033[0m")
 
 def print_final_response(content: List[ContentBlock]):
-    print("\n final reponse: \n")
+    print("\n final response: \n")
     if isinstance(content, list):
         for block in content:
             if hasattr(block, "text"):
@@ -485,12 +568,18 @@ def run_subagent(prompt: str) -> str:
     sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
     sub_handlers = {k: v for k, v in TOOL_HANDLERS.items() if k in sub_tool_names}
 
-    SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+    SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. 
+                        Complete the given task, then summarize your findings."""
     sub_msgs: list[MessageParam] = [{"role": "user", "content": prompt}]
     sub_resp = None
     for _ in range(30):
         sub_resp = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_msgs,tools=sub_tools, max_tokens=8192)
+            model=MODEL, 
+            system=SUBAGENT_SYSTEM, 
+            messages=sub_msgs, 
+            tools=sub_tools, 
+            max_tokens=8192
+        )
         sub_msgs.append({"role": "assistant", "content": sub_resp.content})
         if sub_resp.stop_reason != "tool_use":
             break
@@ -500,9 +589,10 @@ def run_subagent(prompt: str) -> str:
                 handler = sub_handlers.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 results.append({
-                    "type": "tool_result", 
-                    "tool_use_id": block.id, 
-                    "content": str(output)[:50000]})
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output)[:50000]
+                })
         sub_msgs.append({"role": "user", "content": results})
 
     if sub_resp:
@@ -521,9 +611,19 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             print("[auto-compact triggered]")
             messages[:] = auto_compact(messages)
-        
+
+        notifs = BG.drain()
+        if notifs:
+            txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
+            messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
+            messages.append({"role": "assistant", "content": "Noted background results."})
+
         response: Message = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages, max_tokens=8192, tools=TOOLS
+            model=MODEL, 
+            system=SYSTEM, 
+            messages=messages, 
+            max_tokens=8192, 
+            tools=TOOLS
         )
 
         messages.append({"role": "assistant", "content": response.content})
@@ -577,7 +677,7 @@ if __name__ == "__main__":
             break
 
         if query.strip().lower() in ("q", "exit", ""):
-            break        
+            break
         if query.strip() == "/compact":
             if history:
                 print("[manual compact via /compact]")
