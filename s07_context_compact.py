@@ -24,7 +24,9 @@ MODEL: str = os.getenv("MODEL_ID", "glm-5")
 
 SKILLS_DIR = WORKDIR / "skills"
 TASK_DIR = WORKDIR / ".tasks"
-
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+KEEP_RECENT = 3
+TOKEN_THRESHOLD = 100000
 
 # === SECTION: basic tools ===
 def safe_path(p: str) -> Path:
@@ -125,6 +127,7 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+
 # === SECTION: skills loader ===
 class SkillLoader:
     def __init__(self, skills_path: Path) -> None:
@@ -151,6 +154,7 @@ class SkillLoader:
         s = self.skills.get(name)
         if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
+
 
 # === SECTION: task manager ===
 class TaskManager:
@@ -216,7 +220,67 @@ class TaskManager:
         task["status"] = "in_progress"
         self._save(task)
         return f"Claimed task {task_id} for {owner}."
-        
+
+
+# === SECTION: compression ===
+def estimate_tokens(messages: list[MessageParam]) -> int:
+    return len(json.dumps(messages, default=str)) // 4
+
+# -- Layer 1: micro_compact - replace old tool results with placeholders --
+def micro_compact(messages: list[MessageParam]) -> list[MessageParam]:
+    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for part_idx, part in enumerate(msg["content"]):
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_results.append((msg_idx, part_idx, part))
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+    # Find tool_name for each result by matching tool_use_id in prior assistant messages
+    tool_name_map = {}
+    for msg in messages:
+        if msg["role"] == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_name_map[block.id] = block.name
+    # Clear old results (keep last KEEP_RECENT)
+    to_clear = tool_results[:-KEEP_RECENT]
+    for _, _, result in to_clear:
+        if isinstance(result.get("content"), str) and len(result["content"]) > 100:
+            tool_id = result.get("tool_use_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            result["content"] = f"[Previous: used {tool_name}]"
+    return messages
+
+# -- Layer 2: auto_compact - save transcript, summarize, replace messages --
+def auto_compact(messages: list[MessageParam]) -> list[MessageParam]:
+    # Save full transcript to disk
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # summarize
+    conversation_text = json.dumps(messages, default=str)[:80000]
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content":
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        max_tokens=2000,
+    )
+    summary = response.content[0].text
+    # Replace all messages with compressed summary
+    return [
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+    ]
+
 
 # === SECTION: global instances ===
 TODO = TodoManager()
@@ -366,6 +430,11 @@ TOOLS: list[ToolParam] = [
             "required": ["task_id"]
         }
     },
+    {
+        "name": "compress", 
+        "description": "Manually compress conversation context.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
 ]
 
 
@@ -382,9 +451,35 @@ TOOL_HANDLERS = {
     "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("add_blocks")),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
+    "compress": lambda **kw: "Compressing...",
 }
 
-# Subagent
+
+# === SECTION: print function===
+def print_todo(output: object):
+    print("\n\033[33m=== 📋 INITIAL PLAN (Todo List) ===\033[0m")
+    print(output)
+    print("\033[33m=================================\033[0m\n")
+
+def print_tool_call(block: ContentBlock, output: object):
+    print("\033[32m--------------------\033[0m")
+    print(f"\033[32m> {block.name}: {output}\033[0m")
+    print("\033[32m--------------------\033[0m")
+
+def print_thought(block: ContentBlock):
+    print(f"\033[90m[Model Thought]: {block.text}\033[0m")
+
+def print_final_response(content: List[ContentBlock]):
+    print("\n final reponse: \n")
+    if isinstance(content, list):
+        for block in content:
+            if hasattr(block, "text"):
+                print(f"\033[35m{block.text}\033[0m")
+            else:
+                print(f"\033[35m{block}\033[0m")
+
+
+# === SECTION: Subagent ===
 def run_subagent(prompt: str) -> str:
     sub_tool_names = {"bash", "read_file", "write_file", "edit_file"}
     sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
@@ -416,11 +511,17 @@ def run_subagent(prompt: str) -> str:
     return "(subagent failed)"
 
 
-# Agent Loop
+# === SECTION: Agent Loop ===
 def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
     rounds_since_todo = 0
     while True:
         print(f"\033[36mthinking...\n\033[0m")
+
+        micro_compact(messages)
+        if estimate_tokens(messages) > TOKEN_THRESHOLD:
+            print("[auto-compact triggered]")
+            messages[:] = auto_compact(messages)
+        
         response: Message = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages, max_tokens=8192, tools=TOOLS
         )
@@ -431,32 +532,42 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
 
         results: list = []
         used_todo = False
+        manual_compress = False
         for block in response.content:
             if block.type == "text":
-                print(f"\033[90m[Model Thought]: {block.text}\033[0m")
+                print_thought(block)
 
             if block.type == "tool_use":
+                if block.name == "compress":
+                    manual_compress = True
+                    output = "Compressing..."
+                    # continue
+
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print("\033[32m--------------------\033[0m")
-                print(f"\033[32m> {block.name}: {output}\033[0m")
-                print("\033[32m--------------------\033[0m")
+                print_tool_call(block, output)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+
                 if block.name == "todo":
                     used_todo = True
-                    print("\n\033[33m=== 📋 INITIAL PLAN (Todo List) ===\033[0m")
-                    print(output)
-                    print("\033[33m=================================\033[0m\n")
+                    print_todo(output)
+
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
 
         messages.append({"role": "user", "content": results})
 
+        if manual_compress:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
 
+
+
+# === SECTION: Main ===
 if __name__ == "__main__":
     history: list[MessageParam] = []
     while True:
@@ -466,19 +577,22 @@ if __name__ == "__main__":
             break
 
         if query.strip().lower() in ("q", "exit", ""):
-            break
+            break        
+        if query.strip() == "/compact":
+            if history:
+                print("[manual compact via /compact]")
+                history[:] = auto_compact(history)
+            continue
+        if query.strip() == "/compress":
+            if history:
+                print("[manual compress via /compress]")
+                history[:] = auto_compact(history)
+            continue
+        if query.strip() == "/tasks":
+            print(TASKS.list_all())
+            continue
 
         history.append({"role": "user", "content": query})
-
-        response_content: List[ContentBlock] = agent_loop(history)
-
-        print("\n final reponse: \n")
-
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(f"\033[35m{block.text}\033[0m")
-                else:
-                    print(f"\033[35m{block}\033[0m")
-
+        resp: List[ContentBlock] = agent_loop(history)
+        print_final_response(resp)
         print()
