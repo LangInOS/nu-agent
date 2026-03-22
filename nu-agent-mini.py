@@ -135,6 +135,48 @@ class TodoManager:
         return any(item.get("status") != "completed" for item in self.items)
 
 
+# === SECTION: Subagent ===
+def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
+    sub_tool_names = {"bash", "read_file"}
+    if agent_type != "Explore":
+        sub_tool_names.update({"write_file", "edit_file"})
+    
+    sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
+    sub_handlers = {k: v for k, v in TOOL_HANDLERS.items() if k in sub_tool_names}
+
+    SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. 
+                        Complete the given task, then summarize your findings."""
+    sub_msgs: list[MessageParam] = [{"role": "user", "content": prompt}]
+    sub_resp = None
+    for _ in range(30):
+        sub_resp = client.messages.create(
+            model=MODEL, 
+            system=SUBAGENT_SYSTEM, 
+            messages=sub_msgs, 
+            tools=sub_tools, 
+            max_tokens=8192
+        )
+        sub_msgs.append({"role": "assistant", "content": sub_resp.content})
+        if sub_resp.stop_reason != "tool_use":
+            break
+        results = []
+        for block in sub_resp.content:
+            if block.type == "tool_use":
+                handler = sub_handlers.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output)[:50000]
+                })
+        sub_msgs.append({"role": "user", "content": results})
+
+    if sub_resp:
+        return "".join(b.text for b in sub_resp.content if hasattr(b, "text")) or "(no summary)"
+
+    return "(subagent failed)"
+
+
 # === SECTION: skills ===
 class SkillLoader:
     def __init__(self, skills_path: Path) -> None:
@@ -616,48 +658,6 @@ def print_final_response(content: list[ContentBlock]):
                 print(f"\033[35m{block.text}\033[0m")
             else:
                 print(f"\033[35m{block}\033[0m")
-
-
-# === SECTION: Subagent ===
-def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
-    sub_tool_names = {"bash", "read_file"}
-    if agent_type != "Explore":
-        sub_tool_names.update({"write_file", "edit_file"})
-    
-    sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
-    sub_handlers = {k: v for k, v in TOOL_HANDLERS.items() if k in sub_tool_names}
-
-    SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. 
-                        Complete the given task, then summarize your findings."""
-    sub_msgs: list[MessageParam] = [{"role": "user", "content": prompt}]
-    sub_resp = None
-    for _ in range(30):
-        sub_resp = client.messages.create(
-            model=MODEL, 
-            system=SUBAGENT_SYSTEM, 
-            messages=sub_msgs, 
-            tools=sub_tools, 
-            max_tokens=8192
-        )
-        sub_msgs.append({"role": "assistant", "content": sub_resp.content})
-        if sub_resp.stop_reason != "tool_use":
-            break
-        results = []
-        for block in sub_resp.content:
-            if block.type == "tool_use":
-                handler = sub_handlers.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output)[:50000]
-                })
-        sub_msgs.append({"role": "user", "content": results})
-
-    if sub_resp:
-        return "".join(b.text for b in sub_resp.content if hasattr(b, "text")) or "(no summary)"
-
-    return "(subagent failed)"
 
 
 # === SECTION: Agent Loop ===
