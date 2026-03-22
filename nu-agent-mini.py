@@ -352,7 +352,7 @@ class BackgroundManager:
             self.tasks[task_id].update({"status": "completed", "result": output or "(No output)"})
         except Exception as e:
             self.tasks[task_id].update({"status": "error", "result": f"Error: {str(e)}"})
-        self.notifications.put({"task_id": task_id, "status": self.tasks[task_id]["status"], 
+        self.notifications.put({"task_id": task_id, "status": self.tasks[task_id]["status"],
                                 "result": self.tasks[task_id]["result"][:500]})
 
     def check(self, task_id: str = None) -> str:
@@ -447,7 +447,7 @@ class TeammateManager:
         team_name = self.config["team_name"]
         sys_prompt = f"""You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}.
                          Use idle when done with current work. You may auto-claim tasks."""
-        messages = [{"role": "user", "content": prompt}]
+        messages: list[MessageParam] = [{"role": "user", "content": prompt}]
         tool_names = {"bash", "read_file", "write_file", "edit_file", "send_message", "idle", "claim_task"}
         tools = [t for t in TOOLS if t["name"] in tool_names]
         while True:
