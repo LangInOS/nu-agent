@@ -7,14 +7,12 @@ import time
 import uuid
 from pathlib import Path
 from queue import Queue
-from typing import List
 
 from anthropic import Anthropic
 from anthropic.types import ContentBlock, Message, MessageParam, ToolParam
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
@@ -40,6 +38,7 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
+
 # === SECTION: basic tools ===
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -47,23 +46,17 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-
 def run_bash(command: str) -> str:
     forbidden = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in forbidden):
         return "Error: Dangerous command blocked"
-
     try:
-        result = subprocess.run(
-            command, shell=True, cwd=WORKDIR, text=True, timeout=120, capture_output=True
-        )
-
+        result = subprocess.run(command, shell=True, cwd=WORKDIR, text=True, 
+                                timeout=120, capture_output=True)
         out = (result.stdout + result.stderr).strip()
-
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
@@ -75,7 +68,6 @@ def run_read(path: str, limit: int | None = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -84,7 +76,6 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -106,23 +97,23 @@ class TodoManager:
     def update(self, items: list) -> str:
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")
-
         validated = []
         in_progress_count = 0
         for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
+            content = str(item.get("content", "")).strip()
             status = str(item.get("status", "pending")).lower()
+            activeForm = str(item.get("activeForm", "")).strip()
             item_id = str(item.get("id", str(i + 1)))
-
-            if not text:
-                raise ValueError(f"Item {item_id}: text required")
-
+            if not content:
+                raise ValueError(f"Item {item_id}: content required")
             if status not in ["pending", "in_progress", "completed"]:
                 raise ValueError(f"Item {item_id}: invalid status '{status}'")
-
+            if not activeForm:
+                raise ValueError(f"Item {item_id}: activeForm required")
             if status == "in_progress":
                 in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
+            validated.append({"id": item_id, "content": content, "status": status, 
+                              "activeForm": activeForm})
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress at a time")
         self.items = validated
@@ -133,15 +124,15 @@ class TodoManager:
             return "No todos."
         lines = []
         for item in self.items:
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(item["status"], "[?]")
+            suffix = f" <- {item['activeForm']}" if item["status"] == "in_progress" else ""
+            lines.append(f"{marker} #{item['id']}: {item['content']}{suffix}")
         done = sum(1 for t in self.items if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
+
+    def has_open_items(self) -> bool:
+        return any(item.get("status") != "completed" for item in self.items)
 
 
 # === SECTION: skills ===
@@ -165,18 +156,13 @@ class SkillLoader:
     def descriptions(self) -> str:
         if not self.skills:
             return "(no skills)"
-        return "\n".join(
-            f" - {n}: {s['meta'].get('description', '-')}"
-            for n, s in self.skills.items()
-        )
+        return "\n".join(f"  - {n}: {s['meta'].get('description', '-')}" 
+                    for n, s in self.skills.items())
 
     def load(self, name: str) -> str:
         s = self.skills.get(name)
         if not s:
-            return (
-                f"Error: Unknown skill '{name}'. "
-                f"Available: {', '.join(self.skills.keys())}"
-            )
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
 
 
@@ -199,28 +185,15 @@ class TaskManager:
         (TASKS_DIR / f"task_{task['id']}.json").write_text(json.dumps(task, indent=2))
 
     def create(self, subject: str, description: str = "") -> str:
-        task = {
-            "id": self._next_id(),
-            "subject": subject,
-            "description": description,
-            "status": "pending",
-            "owner": None,
-            "blockedBy": [],
-            "blocks": [],
-        }
+        task = {"id": self._next_id(), "subject": subject, "description": description, 
+                "status": "pending", "owner": None, "blockedBy": [], "blocks": []}
         self._save(task)
         return json.dumps(task, indent=2)
 
     def get(self, task_id: int) -> str:
         return json.dumps(self._load(task_id), indent=2)
 
-    def update(
-        self,
-        task_id: int,
-        status: str = None,
-        add_blocked_by: list = None,
-        add_blocks: list = None,
-    ) -> str:
+    def update(self, task_id: int, status: str = None, add_blocked_by: list = None, add_blocks: list = None) -> str:
         task = self._load(task_id)
         if status:
             task["status"] = status
@@ -241,27 +214,15 @@ class TaskManager:
         return json.dumps(task, indent=2)
 
     def list_all(self) -> str:
-        tasks = [
-            json.loads(f.read_text())
-            for f in sorted(TASKS_DIR.glob("task_*.json"))
-        ]
+        tasks = [json.loads(f.read_text()) for f in sorted(TASKS_DIR.glob("task_*.json"))]
         if not tasks:
             return "No tasks."
         lines = []
         for task in tasks:
-            m = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }.get(task["status"], "[?]")
+            m = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(task["status"], "[?]")
             owner = f" @{task['owner']}" if task.get("owner") else ""
-            blocked = (
-                f" (blocked by: {task['blockedBy']})"
-                if task.get("blockedBy")
-                else ""
-            )
+            blocked = f" (blocked by: {task['blockedBy']})" if task.get("blockedBy") else ""
             lines.append(f"{m} #{task['id']}: {task['subject']}{owner}{blocked}")
-
         return "\n".join(lines)
 
     def claim(self, task_id: int, owner: str) -> str:
@@ -318,31 +279,16 @@ def auto_compact(messages: list[MessageParam]) -> list[MessageParam]:
     conversation_text = json.dumps(messages, default=str)[:80000]
     response = client.messages.create(
         model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Summarize this conversation for continuity. Include: "
-                    "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-                    "Be concise but preserve critical details.\n\n" + conversation_text
-                ),
-            }
-        ],
+        messages=[{"role": "user", "content": """Summarize this conversation for continuity. Include: 
+                    1) What was accomplished, 2) Current state, 3) Key decisions made. 
+                    Be concise but preserve critical details.\n\n""" + conversation_text}],
         max_tokens=2000,
     )
     summary = response.content[0].text
     # Replace all messages with compressed summary
     return [
-        {
-            "role": "user",
-            "content": (
-                f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"
-            ),
-        },
-        {
-            "role": "assistant",
-            "content": "Understood. I have the context from the summary. Continuing.",
-        },
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
 
 # === SECTION: background ===
@@ -353,57 +299,26 @@ class BackgroundManager:
 
     def run(self, command: str, timeout: int = 120) -> str:
         task_id = str(uuid.uuid4())[:8]
-        self.tasks[task_id] = {
-            "status": "running",
-            "command": command,
-            "result": None,
-        }
-        threading.Thread(
-            target=self._exec, args=(task_id, command, timeout), daemon=True
-        ).start()
-        return task_id
+        self.tasks[task_id] = {"status": "running", "command": command, "result": None}
+        threading.Thread(target=self._exec, args=(task_id, command, timeout), daemon=True).start()
+        return f"Background task {task_id} started: {command[:80]}"
 
     def _exec(self, task_id: str, command: str, timeout: int):
         try:
-            r = subprocess.run(
-                command,
-                shell=True,
-                cwd=WORKDIR,
-                timeout=timeout,
-                capture_output=True,
-                text=True,
-            )
+            r = subprocess.run(command, shell=True, cwd=WORKDIR, timeout=timeout, capture_output=True, text=True)
             output = (r.stdout + r.stderr).strip()
-            self.tasks[task_id].update(
-                {"status": "completed", "result": output or "(No output)"}
-            )
+            self.tasks[task_id].update({"status": "completed", "result": output or "(No output)"})
         except Exception as e:
-            self.tasks[task_id].update(
-                {"status": "error", "result": f"Error: {str(e)}"}
-            )
-        self.notifications.put(
-            {
-                "task_id": task_id,
-                "status": self.tasks[task_id]["status"],
-                "result": self.tasks[task_id]["result"],
-            }
-        )
+            self.tasks[task_id].update({"status": "error", "result": f"Error: {str(e)}"})
+        self.notifications.put({"task_id": task_id, "status": self.tasks[task_id]["status"], 
+                                "result": self.tasks[task_id]["result"][:500]})
 
     def check(self, task_id: str = None) -> str:
         if task_id:
             task = self.tasks.get(task_id)
-            return (
-                f"[{task['status']}] {task.get('result', '(running)')}"
-                if task
-                else f"Unknown: {task_id}"
-            )
-        return (
-            "\n".join(
-                f"{k}: [{v['status']}] {v['command'][:60]}"
-                for k, v in self.tasks.items()
-            )
-            or "No background tasks."
-        )
+            return f"[{task['status']}] {task.get('result', '(running)')}" if task else f"Unknown: {task_id}"
+        return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" 
+                         for k, v in self.tasks.items()) or "No background tasks."
 
     def drain(self) -> list:
         notifs = []
@@ -417,20 +332,8 @@ class MessageBus:
     def __init__(self) -> None:
         INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
-    def send(
-        self,
-        sender: str,
-        to: str,
-        content: str,
-        msg_type: str = "message",
-        extra: dict = None,
-    ) -> str:
-        msg = {
-            "type": msg_type,
-            "from": sender,
-            "content": content,
-            "timestamp": time.time(),
-        }
+    def send(self, sender: str, to: str, content: str, msg_type: str = "message", extra: dict = None) -> str:
+        msg = {"type": msg_type, "from": sender, "content": content, "timestamp": time.time()}
         if extra:
             msg.update(extra)
         with open(INBOX_DIR / f"{to}.jsonl", "a") as f:
@@ -441,9 +344,7 @@ class MessageBus:
         path = INBOX_DIR / f"{name}.jsonl"
         if not path.exists():
             return []
-        msgs = [
-            json.loads(l) for l in path.read_text().strip().splitlines() if l
-        ]
+        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
         path.write_text("")
         return msgs
 
@@ -459,29 +360,26 @@ class MessageBus:
 # === SECTION: team ===
 class TeammateManager:
     def __init__(self, bus: MessageBus, task_mgr: TaskManager) -> None:
+        TEAM_DIR.mkdir(exist_ok=True)
         self.bus = bus
         self.task_mgr = task_mgr
         self.config_path = TEAM_DIR / "config.json"
         self.config = self._load()
         self.threads = {}
 
-
     def _load(self) -> dict:
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
 
-
     def _save(self):
         self.config_path.write_text(json.dumps(self.config, indent=2))
-
 
     def _find(self, name: str) -> dict:
         for member in self.config["members"]:
             if member["name"] == name:
                 return member
         return None
-
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find(name)
@@ -497,28 +395,19 @@ class TeammateManager:
         threading.Thread(target=self._loop, args=(name, role, prompt), daemon=True).start()
         return f"Spawned '{name}' (role: {role})"
 
-
     def _set_status(self, name: str, status: str) -> None:
         member = self._find(name)
         if member:
             member["status"] = status
             self._save()
 
-
     def _loop(self, name: str, role: str, prompt: str) -> None:
         team_name = self.config["team_name"]
-        sys_prompt = (f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
-                      f"Use idle when done with current work. You may auto-claim tasks.")
+        sys_prompt = f"""You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. 
+                         Use idle when done with current work. You may auto-claim tasks."""
         messages = [{"role": "user", "content": prompt}]
-        tools = [
-            {"name": "bash", "description": "Run command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-            {"name": "read_file", "description": "Read file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-            {"name": "write_file", "description": "Write file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-            {"name": "edit_file", "description": "Edit file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-            {"name": "send_message", "description": "Send message.", "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}}, "required": ["to", "content"]}},
-            {"name": "idle", "description": "Signal no more work.", "input_schema": {"type": "object", "properties": {}}},
-            {"name": "claim_task", "description": "Claim task by ID.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
-        ]
+        tool_names = {"bash", "read_file", "write_file", "edit_file", "send_message", "idle", "claim_task"}
+        tools = [t for t in TOOLS if t["name"] in tool_names]
         while True:
             # -- WORK PHASE --
             for _ in range(50):
@@ -529,13 +418,8 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = client.messages.create(
-                        model=MODEL,
-                        system=sys_prompt,
-                        messages=messages,
-                        tools=tools,
-                        max_tokens=8000,
-                    )
+                    response = client.messages.create(model=MODEL, system=sys_prompt, messages=messages, 
+                                                      tools=tools, max_tokens=8192)
                 except Exception:
                     self._set_status(name, "shutdown")
                     return
@@ -554,10 +438,8 @@ class TeammateManager:
                         elif block.name == "send_message":
                             output = self.bus.send(name, block.input["to"], block.input["content"])
                         else:
-                            dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
-                                        "read_file": lambda **kw: run_read(kw["path"]),
-                                        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-                                        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
+                            dispatch = {k: v for k, v in TOOL_HANDLERS.items() 
+                                        if k in {"bash", "read_file", "write_file", "edit_file"}}
                             output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
                         print(f"  [{name}] {block.name}: {str(output)[:120]}")
                         results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
@@ -591,8 +473,9 @@ class TeammateManager:
                         messages.insert(0, {"role": "user", "content":
                             f"<identity>You are '{name}', role: {role}, team: {team_name}.</identity>"})
                         messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
-                    messages.append({"role": "user", "content":
-                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n{task.get('description', '')}</auto-claimed>"})
+                    messages.append({"role": "user", "content": f"""<auto-claimed>
+                        Task #{task['id']}: {task['subject']}\n{task.get('description', '')}</auto-claimed>"""
+                    })
                     messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
                     resume = True
                     break
@@ -601,7 +484,6 @@ class TeammateManager:
                 return
             self._set_status(name, "working")
     
-
     def list_all(self) -> str:
         if not self.config["members"]: 
             return "No teammates."
@@ -609,7 +491,6 @@ class TeammateManager:
         for member in self.config["members"]:
             lines.append(f"  {member['name']} ({member['role']}): {member['status']}")
         return "\n".join(lines)
-    
 
     def member_names(self) -> list:
         return [member["name"] for member in self.config["members"]]
@@ -655,242 +536,32 @@ Spawn teammates and communicate via inboxes.
 Skills available: {SKILLS.descriptions()}
 """
 
+
 # === SECTION: tool dispatch===
 TOOLS: list[ToolParam] = [
-    {
-        "name": "bash",
-        "description": "Run a shell command.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read file contents.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to file",
-        "input_schema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "edit_file",
-        "description": "Replace exact text in file",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-    },
-    {
-        "name": "todo",
-        "description": "Update task list. Track progress on multi-step tasks.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "text": {"type": "string"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                        },
-                        "required": ["id", "text", "status"],
-                    },
-                }
-            },
-            "required": ["items"],
-        },
-    },
-    {
-        "name": "task",
-        "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Short description of the task"
-                }
-            },
-            "required": ["prompt"]
-        }
-    },
-    {
-        "name": "load_skill",
-        "description": "Load specialized knowledge by name.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"name": {"type": "string", "description": "skill name to load"}},
-            "required": ["name"]
-        }
-    },
-    {
-        "name": "task_create",
-        "description": "Create a new task.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"subject": {"type": "string"}, "description": {"type": "string"}},
-            "required": ["subject"]
-        }
-    },
-    {
-        "name": "task_update",
-        "description": "Update a task's status or dependencies.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "integer"},
-                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                "add_blocked_by": {"type": "array", "items": {"type": "integer"}},
-                "add_blocks": {"type": "array", "items": {"type": "integer"}}
-            },
-            "required": ["task_id"]
-        }
-    },
-    {
-        "name": "task_list",
-        "description": "List all tasks with status summary.",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "task_get",
-        "description": "Get full details of a task by ID.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"task_id": {"type": "integer"}},
-            "required": ["task_id"]
-        }
-    },
-    {
-        "name": "compress",
-        "description": "Manually compress conversation context.",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "background_run",
-        "description": "Run command in background thread.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"},
-                "timeout": {"type": "integer"}
-            },
-            "required": ["command"]
-        }
-    },
-    {
-        "name": "check_background",
-        "description": "Check background task status.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"task_id": {"type": "string"}}
-        }
-    },
-    {
-        "name": "spawn_teammate",
-        "description": "Spawn a persistent autonomous teammate.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "role": {"type": "string"},
-                "prompt": {"type": "string"}
-            },
-            "required": ["name", "role", "prompt"]
-        }
-    },
-    {
-        "name": "list_teammates",
-        "description": "List all teammates.",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "send_message",
-        "description": "Send a message to a teammate.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "to": {"type": "string"},
-                "content": {"type": "string"},
-                "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}
-            },
-            "required": ["to", "content"]
-        }
-    },
-    {
-        "name": "read_inbox",
-        "description": "Read and drain the lead's inbox.",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "broadcast",
-        "description": "Send message to all teammates.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"]
-        }
-    },
-    {
-        "name": "shutdown_request", 
-        "description": "Request a teammate to shut down.",
-        "input_schema": {
-            "type": "object", 
-            "properties": {"teammate": {"type": "string"}}, 
-            "required": ["teammate"]
-        }
-    },
-    {
-        "name": "plan_approval", 
-        "description": "Approve or reject a teammate's plan.",
-        "input_schema": {
-            "type": "object", 
-            "properties": {
-                "request_id": {"type": "string"}, 
-                "approve": {"type": "boolean"}, 
-                "feedback": {"type": "string"}
-            },    
-            "required": ["request_id", "approve"]
-        }
-    },
-    {
-        "name": "idle", 
-        "description": "Enter idle state.",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "claim_task",
-        "description": "Claim a task from the board.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"task_id": {"type": "integer"}},
-            "required": ["task_id"]
-        }
-    },
+    {"name": "bash", "description": "Run a shell command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {"name": "todo", "description": "Update task tracking list.", "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "activeForm": {"type": "string"}}, "required": ["id", "content", "status", "activeForm"]}}}, "required": ["items"]}},
+    {"name": "task", "description": "Spawn a subagent for isolated exploration or work.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "agent_type": {"type": "string", "enum": ["Explore", "general-purpose"]}}, "required": ["prompt"]}},
+    {"name": "load_skill", "description": "Load specialized knowledge by name.", "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "skill name to load"}}, "required": ["name"]}},
+    {"name": "task_create", "description": "Create a new task.", "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
+    {"name": "task_update", "description": "Update a task's status or dependencies.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "add_blocks": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+    {"name": "task_list", "description": "List all tasks with status summary.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "task_get", "description": "Get full details of a task by ID.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+    {"name": "compress", "description": "Manually compress conversation context.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "background_run", "description": "Run command in background thread.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}},
+    {"name": "check_background", "description": "Check background task status.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
+    {"name": "spawn_teammate", "description": "Spawn a persistent autonomous teammate.", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
+    {"name": "list_teammates", "description": "List all teammates.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "send_message", "description": "Send a message to a teammate.", "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+    {"name": "read_inbox", "description": "Read and drain the lead's inbox.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "broadcast", "description": "Send message to all teammates.", "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    {"name": "shutdown_request", "description": "Request a teammate to shut down.", "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+    {"name": "plan_approval", "description": "Approve or reject a teammate's plan.", "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+    {"name": "idle", "description": "Enter idle state.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "claim_task", "description": "Claim a task from the board.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}}
 ]
 
 
@@ -900,7 +571,7 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
-    "task": lambda **kw: run_subagent(kw["prompt"]),
+    "task": lambda **kw: run_subagent(kw["prompt"], kw.get("agent_type", "Explore")),
     "load_skill": lambda **kw: SKILLS.load(kw["name"]),
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw["description"]),
     "task_update": lambda **kw: TASKS.update(
@@ -937,7 +608,7 @@ def print_tool_call(block: ContentBlock, output: object):
 def print_thought(block: ContentBlock):
     print(f"\033[90m[Model Thought]: {block.text}\033[0m")
 
-def print_final_response(content: List[ContentBlock]):
+def print_final_response(content: list[ContentBlock]):
     print("\n final response: \n")
     if isinstance(content, list):
         for block in content:
@@ -948,8 +619,11 @@ def print_final_response(content: List[ContentBlock]):
 
 
 # === SECTION: Subagent ===
-def run_subagent(prompt: str) -> str:
-    sub_tool_names = {"bash", "read_file", "write_file", "edit_file"}
+def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
+    sub_tool_names = {"bash", "read_file"}
+    if agent_type != "Explore":
+        sub_tool_names.update({"write_file", "edit_file"})
+    
     sub_tools = [t for t in TOOLS if t["name"] in sub_tool_names]
     sub_handlers = {k: v for k, v in TOOL_HANDLERS.items() if k in sub_tool_names}
 
@@ -987,7 +661,7 @@ def run_subagent(prompt: str) -> str:
 
 
 # === SECTION: Agent Loop ===
-def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
+def agent_loop(messages: list[MessageParam]) -> list[ContentBlock]:
     rounds_since_todo = 0
     while True:
         print(f"\033[36mthinking...\n\033[0m")
@@ -996,18 +670,18 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             print("[auto-compact triggered]")
             messages[:] = auto_compact(messages)
-        # drain background notifications
+        # background notifications
         notifs = BG.drain()
         if notifs:
             txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
             messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
             messages.append({"role": "assistant", "content": "Noted background results."})
-        # check lead inbox
+        # inbox
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
-        # LLM call
+        # llm call
         response: Message = client.messages.create(
             model=MODEL, 
             system=SYSTEM, 
@@ -1019,7 +693,7 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return response.content
-        # Tool execution
+        # tools execution
         results: list = []
         used_todo = False
         manual_compress = False
@@ -1031,7 +705,6 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
                 if block.name == "compress":
                     manual_compress = True
                     output = "Compressing..."
-                    # continue
 
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
@@ -1045,16 +718,15 @@ def agent_loop(messages: list[MessageParam]) -> List[ContentBlock]:
                     used_todo = True
                     print_todo(output)
 
-        # reminder
+        # todo reminder
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
+        if TODO.has_open_items() and rounds_since_todo >= 3:
             results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
         # manual compress
         if manual_compress:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
-
 
 
 # === SECTION: Main ===
@@ -1089,6 +761,6 @@ if __name__ == "__main__":
             continue
 
         history.append({"role": "user", "content": query})
-        resp: List[ContentBlock] = agent_loop(history)
+        resp: list[ContentBlock] = agent_loop(history)
         print_final_response(resp)
         print()
